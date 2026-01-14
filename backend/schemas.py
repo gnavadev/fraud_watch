@@ -4,13 +4,13 @@ from typing import Optional
 class ProviderBase(BaseModel):
     license_holder: str
     license_number: str
-    license_type: str
     city: str
     capacity: int
     revenue: int
     risk_score: float
-    risk_factors: Optional[str] = None
     status: str
+    ein: Optional[str] = None
+    address: Optional[str] = None
 
 class ProviderResponse(ProviderBase):
     id: int

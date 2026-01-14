@@ -1,16 +1,19 @@
 import requests
 import csv
 import time
+import os
+import random
+from backend.database import SessionLocal
+from backend.models import Provider
+from backend.fraud_engine import calculate_fraud_risk
 
 def get_minneapolis_child_care(query="child care", city_filter="minneapolis", limit=20):
     """
     Fetches nonprofits in MN matching the query, then filters by city locally.
+    Processes fraud risk and saves to database.
     """
     base_url = "https://projects.propublica.org/nonprofits/api/v2/search.json"
-    output_file = f"{city_filter}_{query.replace(' ', '_')}.csv"
     
-    # ProPublica API requires state[id] for state filtering.
-    # We filter for 'MN' at the API level.
     params = {
         "q": query,
         "state[id]": "MN",
@@ -19,11 +22,12 @@ def get_minneapolis_child_care(query="child care", city_filter="minneapolis", li
     headers = {"User-Agent": "Mozilla/5.0 (Educational Project)"}
 
     results = []
+    db = SessionLocal()
     
     print(f"Searching for '{query}' in {city_filter.title()}, MN...")
 
-    while len(results) < limit:
-        try:
+    try:
+        while len(results) < limit:
             response = requests.get(base_url, params=params, headers=headers)
             response.raise_for_status()
             
@@ -35,48 +39,72 @@ def get_minneapolis_child_care(query="child care", city_filter="minneapolis", li
                 break
             
             for org in orgs:
-                # API returns cities in various cases (often UPPERCASE)
                 org_city = org.get("city", "").lower()
                 
                 if org_city == city_filter.lower():
-                    row = {
-                        "Name": org.get("name"),
-                        "EIN": org.get("ein"),
-                        "Address": org.get("address"),
-                        "City": org.get("city"),
-                        "State": org.get("state"),
-                        "Revenue": org.get("revenue", 0),
-                        "Assets": org.get("asset_amount", 0),
-                        "PDF URL": org.get("pdf_url")
+                    ein = str(org.get("ein"))
+                    # Skip if already in DB
+                    existing = db.query(Provider).filter(Provider.ein == ein).first()
+                    if existing:
+                        continue
+
+                    # Mock some additional data for fraud calculation
+                    # In a real app, this would come from licensing/spending DBs
+                    revenue = float(org.get("revenue", 0) or random.randint(50000, 200000))
+                    capacity = random.randint(5, 50)
+                    status = random.choice(["Active", "Active", "Active", "Inactive"])
+                    
+                    # Mock payments for Rule 3, 4, 5
+                    num_payments = random.randint(1, 15)
+                    payments = []
+                    if revenue > 0:
+                        base_pay = revenue / num_payments
+                        for _ in range(num_payments):
+                            payments.append({
+                                "amount": base_pay * random.uniform(0.5, 1.5),
+                                "date": "2024-01-01"
+                            })
+
+                    risk_data = {
+                        "revenue": revenue,
+                        "capacity": capacity,
+                        "status": status,
+                        "ein": ein,
+                        "payments": payments
                     }
-                    results.append(row)
+                    
+                    risk_score, risk_factors = calculate_fraud_risk(risk_data)
+
+                    provider = Provider(
+                        license_holder=org.get("name"),
+                        license_number=f"LIC-{ein}", # Mock license number
+                        address=org.get("address"),
+                        city=org.get("city"),
+                        capacity=capacity,
+                        ein=ein,
+                        revenue=int(revenue),
+                        risk_score=risk_score,
+                        status=status
+                    )
+                    
+                    db.add(provider)
+                    results.append(org.get("name"))
                     
                     if len(results) >= limit:
                         break
             
             print(f"Checked page {params['page']}. Found {len(results)} matches so far.")
             params["page"] += 1
-            
-            # Be polite to the API
             time.sleep(0.5)
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching data: {e}")
-            break
 
-    # Save to CSV
-    if results:
-        keys = results[0].keys()
-        try:
-            with open(output_file, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=keys)
-                writer.writeheader()
-                writer.writerows(results)
-            print(f"\nSuccess! Saved {len(results)} organizations to '{output_file}'.")
-        except IOError as e:
-            print(f"Error saving file: {e}")
-    else:
-        print("No matching organizations found in Minneapolis.")
+        db.commit()
+        print(f"\nSuccess! Saved {len(results)} providers to database.")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     get_minneapolis_child_care()
