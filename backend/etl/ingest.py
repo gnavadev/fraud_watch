@@ -1,101 +1,82 @@
-import pandas as pd
 import requests
+import csv
 import time
-import sys
-import os
-from difflib import SequenceMatcher
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
-sys.path.append(project_root)
-
-from backend.database import SessionLocal, engine, Base
-from backend.models import Provider
-from backend.fraud_engine import calculate_fraud_risk
-
-# Constants
-CSV_FILE = os.path.join(current_dir, "Licensing_Lookup_Results_ Jan.02.2026.csv")
-API_URL = "https://projects.propublica.org/nonprofits/api/v2/search.json"
-
-def get_irs_data(name):
-    """Searches ProPublica for EIN and Revenue."""
-    clean_name = name.replace("Inc", "").replace("LLC", "").strip()
-    try:
-        resp = requests.get(API_URL, params={"q": clean_name, "state[id]": "MN"}, timeout=5)
-        data = resp.json()
-        
-        if data["organizations"]:
-            org = data["organizations"][0]
-            # Match score > 0.6
-            score = SequenceMatcher(None, name.lower(), org["name"].lower()).ratio()
-            if score > 0.6: 
-                return org["ein"], org.get("revenue_amount", 0), "Found"
-    except Exception as e:
-        print(f"API Error: {e}")
+def get_minneapolis_child_care(query="child care", city_filter="minneapolis", limit=20):
+    """
+    Fetches nonprofits in MN matching the query, then filters by city locally.
+    """
+    base_url = "https://projects.propublica.org/nonprofits/api/v2/search.json"
+    output_file = f"{city_filter}_{query.replace(' ', '_')}.csv"
     
-    return None, 0, "Not Found"
+    # ProPublica API requires state[id] for state filtering.
+    # We filter for 'MN' at the API level.
+    params = {
+        "q": query,
+        "state[id]": "MN",
+        "page": 0
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (Educational Project)"}
 
-def run_pipeline():
-    print("--- Starting ETL Pipeline ---")
+    results = []
     
-    # Init DB
-    Base.metadata.create_all(bind=engine)
-    session = SessionLocal()
-    
-    # Load CSV
-    if not os.path.exists(CSV_FILE):
-        print(f"Error: CSV file not found at {CSV_FILE}")
-        return
+    print(f"Searching for '{query}' in {city_filter.title()}, MN...")
 
-    print("Loading CSV...")
-    df = pd.read_csv(CSV_FILE)
-    df = df[df['City'].str.lower() == 'minneapolis'].copy()
-    df['Capacity'] = pd.to_numeric(df['Capacity'], errors='coerce').fillna(0)
-    
-    # Process Top 20
-    top_providers = df.sort_values(by='Capacity', ascending=False).head(20)
-    
-    print(f"Processing {len(top_providers)} providers...")
-    
-    for _, row in top_providers.iterrows():
-        holder_name = row['License Holder']
-        license_num = str(row['License Number'])
-        
-        if session.query(Provider).filter_by(license_number=license_num).first():
-            print(f"Skipping {holder_name} (Already processed)")
-            continue
+    while len(results) < limit:
+        try:
+            response = requests.get(base_url, params=params, headers=headers)
+            response.raise_for_status()
+            
+            data = response.json()
+            orgs = data.get("organizations", [])
+            
+            if not orgs:
+                print("No more pages available from API.")
+                break
+            
+            for org in orgs:
+                # API returns cities in various cases (often UPPERCASE)
+                org_city = org.get("city", "").lower()
+                
+                if org_city == city_filter.lower():
+                    row = {
+                        "Name": org.get("name"),
+                        "EIN": org.get("ein"),
+                        "Address": org.get("address"),
+                        "City": org.get("city"),
+                        "State": org.get("state"),
+                        "Revenue": org.get("revenue", 0),
+                        "Assets": org.get("asset_amount", 0),
+                        "PDF URL": org.get("pdf_url")
+                    }
+                    results.append(row)
+                    
+                    if len(results) >= limit:
+                        break
+            
+            print(f"Checked page {params['page']}. Found {len(results)} matches so far.")
+            params["page"] += 1
+            
+            # Be polite to the API
+            time.sleep(0.5)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching data: {e}")
+            break
 
-        print(f"Fetching: {holder_name}...", end=" ")
-        
-        ein, revenue, status = get_irs_data(holder_name)
-        
-        fraud_data = {
-            "revenue": revenue,
-            "capacity": int(row['Capacity']),
-            "status": status,
-            "license_holder": holder_name
-        }
-        risk_score, risk_factors = calculate_fraud_risk(fraud_data)
-        
-        provider = Provider(
-            license_holder=holder_name,
-            license_number=license_num,
-            license_type=row['License Type'],
-            address=row['AddressLine1'],
-            city=row['City'],
-            capacity=int(row['Capacity']),
-            ein=ein,
-            revenue=revenue,
-            status=status,
-            risk_score=risk_score,
-            risk_factors=risk_factors
-        )
-        session.add(provider)
-        print(f"Risk: {risk_score}% | Rev: ${revenue:,}")
-        time.sleep(0.2) 
-
-    session.commit()
-    print("--- ETL Complete ---")
+    # Save to CSV
+    if results:
+        keys = results[0].keys()
+        try:
+            with open(output_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=keys)
+                writer.writeheader()
+                writer.writerows(results)
+            print(f"\nSuccess! Saved {len(results)} organizations to '{output_file}'.")
+        except IOError as e:
+            print(f"Error saving file: {e}")
+    else:
+        print("No matching organizations found in Minneapolis.")
 
 if __name__ == "__main__":
-    run_pipeline()
+    get_minneapolis_child_care()

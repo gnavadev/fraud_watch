@@ -6,3 +6,7 @@ pandas
 requests
 python-dotenv
 pydantic-settings
+numpy
+scikit-learn
+matplotlib
+joblib
